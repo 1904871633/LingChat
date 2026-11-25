@@ -89,6 +89,13 @@ jobs:
           distribution: "zulu"
           java-version: "21"
 
+      - name: 降级 Tauri CLI 到 2.11.1（规避 Gradle 8.14.5 的 projectDir 验证错误）
+        # 原因：@tauri-apps/cli 2.12.x 生成的 Android 工程模板中，
+        # BuildTask 的 projectDir 属性没有默认值，Gradle 8.14.5 会判为硬错误：
+        #   "在插件 rust 类型中，'BuildTask'属性'projectDir'没有配置值"
+        # 2.11.1 生成的旧模板没有该属性，官方 11-18 构建成功用的就是 2.11.1。
+        run: pnpm add -D @tauri-apps/cli@2.11.1 --save-exact
+
       - name: 拉 LFS 图标并初始化资源
         run: |
           git lfs pull src-tauri/icons/icon.png
