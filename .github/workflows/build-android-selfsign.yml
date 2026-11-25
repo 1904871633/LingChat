@@ -1,0 +1,154 @@
+name: 安卓发行版构建（自签版）
+
+# 用途：fork 官方仓库后，用自己生成的临时密钥签名出 APK。
+# 与官方 build-android.yml 的差异：
+#   1. 不需要任何 secrets（官方用私钥 ANDROID_KEY_BASE64，fork 拿不到）
+#   2. 构建时现场 keytool 生成临时 keystore，apksigner 签名
+#   3. 产出上传为 Actions artifact，不发布 Release
+#   4. 支持指定 tag 检出（默认 v0.6.0beta1），避免 fork 默认分支是 main 导致内容不符
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "要构建的 Tag 名称（如 v0.6.0beta1）"
+        required: true
+        type: string
+        default: "v0.6.0beta1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
+      CARGO_PROFILE_RELEASE_STRIP: "true"
+
+    steps:
+      - name: 检出官方仓库的指定 tag
+        uses: actions/checkout@v4
+        with:
+          # 关键：直接从官方仓库 checkout 指定 tag。
+          # 原因：GitHub fork 不会复制 tag，且官方 main 停留在 v0.5.2 旧代码（848fd34），
+          # 只有从上游仓库按 tag 检出才能拿到 v0.6.0beta1 的真实源码。
+          repository: SlimeBoyOwO/LingChat
+          ref: ${{ github.event.inputs.tag_name }}
+          fetch-depth: 0
+          lfs: true
+
+      - name: 安装 pnpm + Node
+        uses: pnpm/setup@v1
+        with:
+          runtime: node@26
+          cache: true
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: 设置 Rust 缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: 安装 Linux 依赖 (Ubuntu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install eatmydata
+          sudo eatmydata apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev \
+            libpipewire-0.3-dev \
+            libspa-0.2-dev \
+            libgbm-dev \
+            libegl1-mesa-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxrandr-dev \
+            libxcomposite-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxtst-dev \
+            libwayland-dev \
+            libdbus-1-dev \
+            zip
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "21"
+
+      - name: 拉 LFS 图标并初始化资源
+        run: |
+          git lfs pull src-tauri/icons/icon.png
+          pnpm run init
+
+      - name: 准备 Android 项目
+        run: pnpm android:prepare
+
+      - name: 缓存 Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('src-tauri/gen/android/**/*.gradle*', 'src-tauri/gen/android/**/gradle-wrapper.properties', 'src-tauri/gen/android/gradle/libs.versions.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: 生成临时签名密钥
+        run: |
+          keytool -genkeypair -v \
+            -keystore $HOME/self-sign.jks \
+            -alias lingchat \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass lingchat123 \
+            -keypass lingchat123 \
+            -dname "CN=LingChat Self Signed, OU=Dev, O=Dev, L=Dev, S=Dev, C=CN"
+
+      - name: 构建 Android APK
+        run: pnpm android:build
+
+      - name: 重命名 + 签名 APK
+        run: |
+          VERSION="${{ github.event.inputs.tag_name }}"
+          APK_DIR="src-tauri/gen/android/app/build/outputs/apk/universal/release"
+          ORIGINAL_APK="$APK_DIR/app-universal-release-unsigned.apk"
+          NEW_NAME="LingChat-${VERSION}-selfsigned-universal.apk"
+
+          if [[ -f "$ORIGINAL_APK" ]]; then
+            mv "$ORIGINAL_APK" "$APK_DIR/$NEW_NAME"
+          else
+            echo "未找到 unsigned APK，列出目录内容："
+            ls -la "$APK_DIR" || true
+            exit 1
+          fi
+
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name apksigner 2>/dev/null | head -1)
+          "$APKSIGNER" sign \
+            --ks "$HOME/self-sign.jks" \
+            --ks-key-alias lingchat \
+            --ks-pass pass:lingchat123 \
+            --key-pass pass:lingchat123 \
+            "$APK_DIR/$NEW_NAME"
+          "$APKSIGNER" verify "$APK_DIR/$NEW_NAME"
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+
+      - name: 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: LingChat-${{ github.event.inputs.tag_name }}-universal-apk
+          path: src-tauri/gen/android/app/build/outputs/apk/universal/release/LingChat-${{ github.event.inputs.tag_name }}-selfsigned-universal.apk
+          retention-days: 7
